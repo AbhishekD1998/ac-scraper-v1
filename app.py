@@ -610,3 +610,47 @@ elif tab == "History":
                 )
             else:
                 st.info("No rows found for this batch.")
+                # --------------------- DIAGNOSTICS (Append-only) ---------------------
+def _diag_google_test():
+    import json
+    gkey = st.secrets.get("GOOGLE_API_KEY")
+    gcx  = st.secrets.get("GOOGLE_CX")
+    st.write("GOOGLE_API_KEY present:", bool(gkey))
+    st.write("GOOGLE_CX present:", bool(gcx))
+    if not (gkey and gcx):
+        st.error("Secrets missing for Google.")
+        return
+    import aiohttp, asyncio
+    async def go():
+        async with aiohttp.ClientSession() as s:
+            async with s.get("https://www.googleapis.com/customsearch/v1",
+                             params={"key": gkey, "cx": gcx, "q": "Amphenol", "num": 1}) as r:
+                st.code(f"HTTP {r.status}")
+                try:
+                    data = await r.json()
+                except Exception:
+                    data = {"text": await r.text()}
+                st.json(data)
+    asyncio.run(go())
+
+def _diag_fetch_test():
+    import aiohttp, asyncio
+    async def go():
+        async with aiohttp.ClientSession() as s:
+            async with s.get("https://www.murata.com", headers={"User-Agent":
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+            }) as r:
+                text = await r.text(errors="ignore")
+                st.write("HTTP status:", r.status, "Final URL:", str(r.url))
+                st.code(text[:1000])
+    asyncio.run(go())
+
+st.sidebar.markdown("---")
+if st.sidebar.button("Open Diagnostics"):
+    st.title("🧪 Diagnostics")
+    st.subheader("Google CSE test")
+    _diag_google_test()
+    st.subheader("Plain fetch test")
+    _diag_fetch_test()
+    st.stop()
+# --------------------------------------------------------------------
