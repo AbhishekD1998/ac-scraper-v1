@@ -1,36 +1,50 @@
-# app.py
-import os, re, asyncio, json
+import os, re, json, asyncio
 from datetime import datetime
 from urllib.parse import urlparse, urljoin
 
 import streamlit as st
 import pandas as pd
 import aiohttp
-import phonenumbers
 from bs4 import BeautifulSoup
+import phonenumbers
 from sqlalchemy import create_engine, text
 from sqlalchemy.engine import Engine
 
-# =================== APP CONFIG ===================
+# ─────────────────────────────────────────────────────────
+# APP CONFIG
+# ─────────────────────────────────────────────────────────
 st.set_page_config(page_title="AC Scraper", layout="wide", page_icon="🅰️")
 st.markdown("<h2 style='text-align:center;margin-bottom:0'>AC Scraper</h2>", unsafe_allow_html=True)
 st.markdown("<div style='text-align:center;color:#666;margin-top:4px;'>Powered by Abhishek Creations</div>", unsafe_allow_html=True)
 st.markdown("---")
 
-# =================== AUTH ===================
+# ─────────────────────────────────────────────────────────
+# CREDENTIALS (Secrets with hard fallback values you provided)
+# ─────────────────────────────────────────────────────────
 USERNAME = st.secrets.get("USERNAME", "abhishekcreations")
 PASSWORD = st.secrets.get("PASSWORD", "ac2006")
+
+# Search keys (prefer secrets; fallback to the values you shared)
+BING_API_KEY = st.secrets.get("BING_API_KEY", "GBPg4aTJMsOuszHOmyH9WtxMh5IuATnnMxz40k4cRw2Y8FQbMCxXJQQJ99BIACYeBjFXJ3w3AAAEACOGhOLu")
+BING_ENDPOINT = st.secrets.get("BING_ENDPOINT", "https://ac-scraper-bing.cognitiveservices.azure.com")
+
+GOOGLE_API_KEY = st.secrets.get("GOOGLE_API_KEY", "AIzaSyBOKdDa8bRYLsBKvEfJlR7fn6v25OzjWzc")
+GOOGLE_CX      = st.secrets.get("GOOGLE_CX", "d4816afb144cb4f3b")
+
+# DB (SQLite by default; Postgres if DATABASE_URL provided)
+DATABASE_URL = st.secrets.get("DATABASE_URL", "").strip()
+
+# ─────────────────────────────────────────────────────────
+# LOGIN
+# ─────────────────────────────────────────────────────────
 if "logged_in" not in st.session_state:
     st.session_state.logged_in = False
 
 if not st.session_state.logged_in:
     st.title("🔒 Login")
-    col1, col2 = st.columns(2)
-    with col1:
-        u = st.text_input("Username")
-    with col2:
-        p = st.text_input("Password", type="password")
-    if st.button("Login", type="primary"):
+    u = st.text_input("Username")
+    p = st.text_input("Password", type="password")
+    if st.button("Login"):
         if u.strip() == USERNAME and p.strip() == PASSWORD:
             st.session_state.logged_in = True
             st.rerun()
@@ -38,20 +52,19 @@ if not st.session_state.logged_in:
             st.error("Invalid credentials")
     st.stop()
 
-# =================== SIDEBAR NAV ===================
-tab = st.sidebar.radio(
-    "Navigation",
-    ["Scraper (Websites CSV)", "Company → Contact Finder", "History", "Diagnostics"],
-    index=0
-)
+# ─────────────────────────────────────────────────────────
+# NAV
+# ─────────────────────────────────────────────────────────
+tab = st.sidebar.radio("Navigation", ["Scraper (Websites CSV)", "Company → Contact Finder", "History", "Diagnostics"], index=0)
 st.sidebar.markdown("---")
 st.sidebar.caption("Abhishek Creations © 2025 – All Rights Reserved")
 
-# =================== DB (SQLite by default; Postgres if DATABASE_URL provided) ===================
+# ─────────────────────────────────────────────────────────
+# DB SETUP
+# ─────────────────────────────────────────────────────────
 def get_engine() -> Engine:
-    db_url = st.secrets.get("DATABASE_URL", "").strip()
-    if db_url:
-        return create_engine(db_url, pool_pre_ping=True, future=True)
+    if DATABASE_URL:
+        return create_engine(DATABASE_URL, pool_pre_ping=True, future=True)
     return create_engine("sqlite:///ac_scraper.db", future=True)
 
 engine = get_engine()
@@ -81,6 +94,7 @@ def init_db():
           FOREIGN KEY (scrape_id) REFERENCES scrapes(id)
         );
         """)
+init_db()
 
 def create_scrape_batch(description: str, tool_type: str) -> int:
     now = datetime.utcnow()
@@ -89,19 +103,20 @@ def create_scrape_batch(description: str, tool_type: str) -> int:
             text("INSERT INTO scrapes (created_at, year, month, description, tool_type) VALUES (:ts,:y,:m,:d,:t)"),
             {"ts": now, "y": now.year, "m": now.month, "d": description.strip(), "t": tool_type}
         )
-        # last id for SQLite vs Postgres
         if engine.url.get_backend_name().startswith("sqlite"):
-            sid = conn.execute(text("SELECT last_insert_rowid()")).scalar()
+            scrape_id = conn.execute(text("SELECT last_insert_rowid()")).scalar()
         else:
-            sid = conn.execute(text("SELECT CAST(CURRVAL(pg_get_serial_sequence('scrapes','id')) AS INT)")).scalar()
-    return int(sid)
+            scrape_id = conn.execute(text("SELECT LASTVAL()")).scalar()
+    return int(scrape_id)
 
 def save_records(scrape_id: int, df: pd.DataFrame):
     cols = ["company","website","email","phone","address","source"]
     for c in cols:
-        if c not in df.columns: df[c] = ""
+        if c not in df.columns:
+            df[c] = ""
     rows = df[cols].to_dict(orient="records")
-    if not rows: return
+    if not rows:
+        return
     with engine.begin() as conn:
         conn.execute(
             text("""
@@ -111,9 +126,9 @@ def save_records(scrape_id: int, df: pd.DataFrame):
             [{"scrape_id": scrape_id, **r} for r in rows]
         )
 
-init_db()
-
-# =================== REGEX/HELPERS ===================
+# ─────────────────────────────────────────────────────────
+# SCRAPING HELPERS
+# ─────────────────────────────────────────────────────────
 EMAIL_RE = re.compile(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}", re.I)
 OBFUSCATED_RE = re.compile(
     r"([A-Za-z0-9._%+-]+)\s*(?:\[at\]|\(at\)| at |\s@\s|@)\s*([A-Za-z0-9.-]+)\s*(?:\[dot\]|\(dot\)| dot |\s\.\s|\.)\s*([A-Za-z]{2,})",
@@ -129,27 +144,34 @@ def normalize_url(url: str):
     if not urlparse(url).scheme: url = "http://" + url
     return url if urlparse(url).netloc else None
 
+def clean_visible_text(html: str):
+    soup = BeautifulSoup(html, "html.parser")
+    for tag in soup(["script","style","noscript","iframe"]):
+        tag.decompose()
+    return soup.get_text(separator="\n", strip=True)
+
 def extract_emails(text: str):
     if not text: return []
     found = set(m.strip() for m in EMAIL_RE.findall(text))
     for m in OBFUSCATED_RE.findall(text):
         local, domain, tld = m
         found.add(f"{local}@{domain}.{tld}")
-    # filter obvious junk
-    return sorted(e for e in found if "@" in e and len(e) <= 254 and not e.lower().startswith("no-reply"))
+    # prefer non-noreply first ordering (keep uniqueness)
+    sorted_list = sorted(found, key=lambda e: ("noreply" in e.lower() or "no-reply" in e.lower(), e))
+    return [e for e in sorted_list if "@" in e and len(e) <= 254]
 
 def extract_phones(text: str):
-    res = set()
+    results = set()
     for raw in PHONE_RE.findall(text or ""):
         try:
             for region in ("US","IN","GB","DE","AE"):
-                parsed = phonenumbers.parse(raw, region)
-                if phonenumbers.is_possible_number(parsed) and phonenumbers.is_valid_number(parsed):
-                    res.add(phonenumbers.format_number(parsed, phonenumbers.PhoneNumberFormat.INTERNATIONAL))
+                p = phonenumbers.parse(raw, region)
+                if phonenumbers.is_possible_number(p) and phonenumbers.is_valid_number(p):
+                    results.add(phonenumbers.format_number(p, phonenumbers.PhoneNumberFormat.INTERNATIONAL))
                     break
         except Exception:
             continue
-    return sorted(res)
+    return sorted(results)
 
 def extract_address_snippets(text: str):
     if not text: return []
@@ -171,12 +193,6 @@ def extract_address_snippets(text: str):
             clean.append(s[:300])
     return clean[:3]
 
-def clean_visible_text(html: str):
-    soup = BeautifulSoup(html, "html.parser")
-    for tag in soup(["script","style","noscript","iframe"]):
-        tag.decompose()
-    return soup.get_text(separator="\n", strip=True)
-
 async def fetch(session: aiohttp.ClientSession, url: str, timeout_s: int, tries: int):
     for attempt in range(1, tries+1):
         try:
@@ -185,7 +201,7 @@ async def fetch(session: aiohttp.ClientSession, url: str, timeout_s: int, tries:
                     txt = await resp.text(errors="ignore")
                     return txt, str(resp.url)
         except Exception:
-            await asyncio.sleep(0.5 * attempt)
+            await asyncio.sleep(0.6 * attempt)
     return None, url
 
 def find_contact_links(base: str, html: str):
@@ -197,7 +213,66 @@ def find_contact_links(base: str, html: str):
         text = (a.get_text() or "").lower()
         if any(k in href.lower() for k in CONTACT_KEYS) or any(k in text for k in CONTACT_KEYS):
             links.append(urljoin(base, href))
+    # unique + limit
     return list(dict.fromkeys(links))[:6]
+
+# ─────────────────────────────────────────────────────────
+# SEARCH (Bing first, Google fallback)
+# ─────────────────────────────────────────────────────────
+def _bing_path_for_endpoint(endpoint: str) -> str:
+    # If using Cognitive Services endpoint -> /bing/v7.0/search
+    # If using global Bing endpoint -> /v7.0/search
+    ep = (endpoint or "").lower().strip("/")
+    return "/bing/v7.0/search" if "cognitiveservices.azure.com" in ep else "/v7.0/search"
+
+async def search_official_site(session, company: str, timeout_s=12):
+    # 1) Bing (Azure)
+    if BING_API_KEY and BING_ENDPOINT:
+        try:
+            path = _bing_path_for_endpoint(BING_ENDPOINT)
+            url = f"{BING_ENDPOINT.rstrip('/')}{path}"
+            headers = {"Ocp-Apim-Subscription-Key": BING_API_KEY}
+            params = {"q": company, "count": 5, "responseFilter": "Webpages", "mkt": "en-US", "safeSearch": "Moderate"}
+            async with asyncio.timeout(timeout_s):
+                async with session.get(url, params=params, headers=headers) as r:
+                    if r.status == 200:
+                        data = await r.json()
+                        web = (data or {}).get("webPages", {}).get("value", [])
+                        candidates = []
+                        for it in web:
+                            link = it.get("url")
+                            if link:
+                                candidates.append(link)
+                        # pick a homepage-ish link if possible
+                        for link in candidates:
+                            if is_probably_homepage(link): 
+                                return link
+                        if candidates:
+                            return candidates[0]
+                    # if 401/404 etc, fall through to Google
+        except Exception:
+            pass
+
+    # 2) Google CSE (daily quota 100)
+    if GOOGLE_API_KEY and GOOGLE_CX:
+        try:
+            gurl = "https://www.googleapis.com/customsearch/v1"
+            params = {"key": GOOGLE_API_KEY, "cx": GOOGLE_CX, "q": company, "num": 3}
+            async with asyncio.timeout(timeout_s):
+                async with session.get(gurl, params=params) as r:
+                    if r.status == 200:
+                        data = await r.json()
+                        items = (data or {}).get("items", [])
+                        for it in items:
+                            link = it.get("link")
+                            if link and is_probably_homepage(link):
+                                return link
+                        if items:
+                            return items[0].get("link")
+        except Exception:
+            pass
+
+    return None
 
 def is_probably_homepage(url: str) -> bool:
     try:
@@ -210,65 +285,9 @@ def is_probably_homepage(url: str) -> bool:
     except Exception:
         return False
 
-# =================== SEARCH (Bing → Google → SerpAPI) ===================
-async def search_official_site(session, company: str, timeout_s=10):
-    # 1) Azure Bing Search v7 (preferred)
-    bkey = st.secrets.get("BING_API_KEY")
-    bend = (st.secrets.get("BING_ENDPOINT") or "https://api.bing.microsoft.com").rstrip("/")
-    if bkey:
-        try:
-            url = f"{bend}/bing/v7.0/search"
-            headers = {"Ocp-Apim-Subscription-Key": bkey}
-            params = {"q": company, "count": 5, "responseFilter": "Webpages"}
-            async with asyncio.timeout(timeout_s):
-                async with session.get(url, params=params, headers=headers) as r:
-                    data = await r.json()
-                    web = (data or {}).get("webPages", {}).get("value", [])
-                    for it in web:
-                        link = it.get("url")
-                        if link and is_probably_homepage(link): return link
-                    if web: return web[0].get("url")
-        except Exception:
-            pass
-
-    # 2) Google CSE
-    gkey = st.secrets.get("GOOGLE_API_KEY")
-    gcx  = st.secrets.get("GOOGLE_CX")
-    if gkey and gcx:
-        try:
-            url = "https://www.googleapis.com/customsearch/v1"
-            params = {"key": gkey, "cx": gcx, "q": company, "num": 3}
-            async with asyncio.timeout(timeout_s):
-                async with session.get(url, params=params) as r:
-                    data = await r.json()
-                    items = (data or {}).get("items", [])
-                    for it in items:
-                        link = it.get("link")
-                        if link and is_probably_homepage(link): return link
-                    if items: return items[0].get("link")
-        except Exception:
-            pass
-
-    # 3) SerpAPI
-    skey = st.secrets.get("SERPAPI_KEY")
-    if skey:
-        try:
-            url = "https://serpapi.com/search.json"
-            params = {"engine": "google", "q": company, "api_key": skey}
-            async with asyncio.timeout(timeout_s):
-                async with session.get(url, params=params) as r:
-                    data = await r.json()
-                    org = (data or {}).get("organic_results", [])
-                    for it in org:
-                        link = it.get("link")
-                        if link and is_probably_homepage(link): return link
-                    if org: return org[0].get("link")
-        except Exception:
-            pass
-
-    return None
-
-# =================== PIPELINES ===================
+# ─────────────────────────────────────────────────────────
+# PIPELINES
+# ─────────────────────────────────────────────────────────
 async def process_row_website(session, sem, row, opts):
     async with sem:
         company = (row.get("company") or row.get("Company") or row.get("name") or "").strip()
@@ -306,10 +325,7 @@ async def process_row_website(session, sem, row, opts):
         all_emails = sorted(sources.keys())
         if all_emails:
             for e in all_emails:
-                result.append({
-                    "company": company, "website": final, "email": e,
-                    "phone": "", "address": "", "source": ",".join(sorted(sources.get(e, {final})))
-                })
+                result.append({"company": company, "website": final, "email": e, "phone": "", "address": "", "source": ",".join(sorted(sources.get(e, {final})))})
             return result, None
         else:
             failed["notes"] = "no-emails-found"
@@ -320,8 +336,7 @@ async def run_all_website(rows, opts, cb=None):
     connector = aiohttp.TCPConnector(limit_per_host=opts["concurrency"], ssl=False)
     sem = asyncio.Semaphore(opts["concurrency"])
     results, failed = [], []
-    headers = {"User-Agent":"AC-Scraper/1.0 (+https://example.com)"}
-    async with aiohttp.ClientSession(timeout=timeout_cfg, connector=connector, trust_env=True, headers=headers) as session:
+    async with aiohttp.ClientSession(timeout=timeout_cfg, connector=connector, trust_env=True, headers={"User-Agent":"AC-Scraper/1.0"}) as session:
         tasks = [process_row_website(session, sem, r, opts) for r in rows]
         total = len(tasks); done = 0
         for fut in asyncio.as_completed(tasks):
@@ -360,7 +375,8 @@ async def company_to_contacts(session, company, opts):
     for p in phones: sources.setdefault(f"PHONE::{p}", set()).add(final)
     for a in addrs:  sources.setdefault(f"ADDR::{a}", set()).add(final)
 
-    email_list   = sorted([k for k in sources if not k.startswith(("PHONE::","ADDR::"))])
+    email_list   = sorted([k for k in sources if not k.startswith(("PHONE::","ADDR::"))],
+                          key=lambda e: ("noreply" in e.lower() or "no-reply" in e.lower(), e))
     phone_list   = sorted([k.split("::",1)[1] for k in sources if k.startswith("PHONE::")])
     address_list = sorted([k.split("::",1)[1] for k in sources if k.startswith("ADDR::")])
 
@@ -384,8 +400,7 @@ async def run_all_company(names, opts, cb=None):
     connector = aiohttp.TCPConnector(limit_per_host=opts["concurrency"], ssl=False)
     sem = asyncio.Semaphore(opts["concurrency"])
     results, failed = [], []
-    headers = {"User-Agent":"AC-Scraper/1.0 (+https://example.com)"}
-    async with aiohttp.ClientSession(timeout=timeout_cfg, connector=connector, trust_env=True, headers=headers) as session:
+    async with aiohttp.ClientSession(timeout=timeout_cfg, connector=connector, trust_env=True, headers={"User-Agent":"AC-Scraper/1.0"}) as session:
         tasks = [company_to_contacts(session, nm, opts) for nm in names]
         total = len(tasks); done = 0
         for fut in asyncio.as_completed(tasks):
@@ -396,15 +411,18 @@ async def run_all_company(names, opts, cb=None):
             if cb: cb(done, total)
     return results, failed
 
-# =================== UI: WEBSITES CSV ===================
+# ─────────────────────────────────────────────────────────
+# UI: WEBSITES CSV
+# ─────────────────────────────────────────────────────────
 if tab.startswith("Scraper"):
     st.title("📧 Email Scraper (Websites CSV)")
     description = st.text_input("Batch description (required before scraping)", placeholder="e.g., SMM Hamburg exhibitors Aug 2025")
     uploaded = st.file_uploader("Upload CSV / XLSX (columns: company, website)", type=["csv","xlsx","xls"])
+
     colA, colB, colC = st.columns(3)
     with colA: follow_contacts = st.checkbox("Follow contact/about pages (fallback)", value=True)
-    with colB: concurrency = st.slider("Concurrency", 2, 60, value=12)
-    with colC: timeout = st.slider("Timeout (sec)", 6, 30, value=12)
+    with colB: concurrency = st.slider("Concurrency", 2, 48, value=10)
+    with colC: timeout = st.slider("Timeout (sec)", 6, 24, value=12)
     tries = st.slider("Retries", 1, 4, value=2)
 
     if uploaded:
@@ -427,7 +445,8 @@ if tab.startswith("Scraper"):
             opts = {"follow_contacts": follow_contacts, "concurrency": concurrency, "timeout": timeout, "tries": tries}
 
             def cb(done, total):
-                progress_bar.progress(int(done/total*100))
+                pct = int(done/total*100) if total else 100
+                progress_bar.progress(pct)
                 logs.append(f"Processed {done}/{total}")
                 log.code("\n".join(logs[-12:]))
 
@@ -436,43 +455,31 @@ if tab.startswith("Scraper"):
             if results:
                 out = pd.DataFrame(results).drop_duplicates(subset=["company","website","email"])
                 st.success(f"Found {len(out)} email rows.")
-                st.dataframe(out.head(25), use_container_width=True)
+                st.dataframe(out.head(25))
                 save_records(scrape_id, out)
-                st.info("Saved to database. (History tab)")
-                st.download_button(
-                    "Download results CSV",
-                    out.to_csv(index=False).encode("utf-8"),
-                    file_name=f"emails_{datetime.utcnow().strftime('%Y%m%dT%H%M%SZ')}.csv"
-                )
+                st.info("Saved to database. You can find it later under the History tab.")
+                st.download_button("Download results CSV", out.to_csv(index=False).encode("utf-8"),
+                                   file_name=f"emails_{datetime.utcnow().strftime('%Y%m%dT%H%M%SZ')}.csv")
             if failed:
                 miss = pd.DataFrame(failed)
                 st.markdown("### No-email / failed sites (preview)")
-                st.dataframe(miss.head(25), use_container_width=True)
-                st.download_button(
-                    "Download failed CSV",
-                    miss.to_csv(index=False).encode("utf-8"),
-                    file_name=f"failed_{datetime.utcnow().strftime('%Y%m%dT%H%M%SZ')}.csv"
-                )
+                st.dataframe(miss.head(25))
+                st.download_button("Download failed CSV", miss.to_csv(index=False).encode("utf-8"),
+                                   file_name=f"failed_{datetime.utcnow().strftime('%Y%m%dT%H%M%SZ')}.csv")
 
-# =================== UI: COMPANY → CONTACT FINDER ===================
+# ─────────────────────────────────────────────────────────
+# UI: COMPANY → CONTACT FINDER
+# ─────────────────────────────────────────────────────────
 elif tab.startswith("Company"):
     st.title("🏢 Company → Contact Finder")
 
-    # At least one provider required
-    has_provider = bool(st.secrets.get("BING_API_KEY")) or \
-                   bool(st.secrets.get("GOOGLE_API_KEY") and st.secrets.get("GOOGLE_CX")) or \
-                   bool(st.secrets.get("SERPAPI_KEY"))
-    if not has_provider:
-        st.warning("Add a search provider in Secrets (Bing Azure preferred, else Google CSE or SerpAPI).")
-        st.stop()
-
     description = st.text_input("Batch description (required before finding)", placeholder="e.g., Marine OEMs shortlist Sept 2025")
-    txt = st.text_area("Companies (one per line)", height=160, placeholder="ACME Corp\nFoo Technologies\nBar Shipping GmbH")
+    txt = st.text_area("Companies (one per line)", height=180, placeholder="ACME Corp\nFoo Technologies\nBar Shipping GmbH")
 
     colA, colB, colC = st.columns(3)
     with colA: follow_contacts = st.checkbox("Follow contact/about pages", value=True)
-    with colB: concurrency = st.slider("Concurrency", 2, 40, value=10)
-    with colC: timeout = st.slider("Timeout (sec)", 6, 30, value=12)
+    with colB: concurrency = st.slider("Concurrency", 2, 32, value=8)
+    with colC: timeout = st.slider("Timeout (sec)", 6, 24, value=12)
     tries = st.slider("Retries", 1, 4, value=2)
 
     if st.button("Start Finding", type="primary", disabled=not (txt.strip() and description.strip())):
@@ -482,38 +489,37 @@ elif tab.startswith("Company"):
         scrape_id = create_scrape_batch(description.strip(), "company_search")
 
         def cb(done, total):
-            progress_bar.progress(int(done/total*100))
+            pct = int(done/total*100) if total else 100
+            progress_bar.progress(pct)
             logs.append(f"Processed {done}/{total}")
             log.code("\n".join(logs[-12:]))
 
-        results, failed = asyncio.run(run_all_company(
-            companies,
-            {"timeout": timeout, "tries": tries, "follow_contacts": follow_contacts, "concurrency": concurrency},
-            cb=cb
-        ))
+        results, failed = asyncio.run(
+            run_all_company(
+                companies,
+                {"timeout": timeout, "tries": tries, "follow_contacts": follow_contacts, "concurrency": concurrency},
+                cb=cb
+            )
+        )
 
         if results:
             df_out = pd.DataFrame(results).drop_duplicates(subset=["company","website","email"])
             st.success(f"Found {len(df_out)} email rows.")
-            st.dataframe(df_out.head(25), use_container_width=True)
+            st.dataframe(df_out.head(25))
             save_records(scrape_id, df_out)
-            st.info("Saved to database. (History tab)")
-            st.download_button(
-                "Download contacts CSV",
-                df_out.to_csv(index=False).encode("utf-8"),
-                file_name=f"contacts_{datetime.utcnow().strftime('%Y%m%dT%H%M%SZ')}.csv"
-            )
+            st.info("Saved to database. You can find it later under the History tab.")
+            st.download_button("Download contacts CSV", df_out.to_csv(index=False).encode("utf-8"),
+                               file_name=f"contacts_{datetime.utcnow().strftime('%Y%m%dT%H%M%SZ')}.csv")
         if failed:
             df_fail = pd.DataFrame(failed)
             st.markdown("### Not found / failed")
-            st.dataframe(df_fail.head(25), use_container_width=True)
-            st.download_button(
-                "Download failed CSV",
-                df_fail.to_csv(index=False).encode("utf-8"),
-                file_name=f"company_failed_{datetime.utcnow().strftime('%Y%m%dT%H%M%SZ')}.csv"
-            )
+            st.dataframe(df_fail.head(25))
+            st.download_button("Download failed CSV", df_fail.to_csv(index=False).encode("utf-8"),
+                               file_name=f"company_failed_{datetime.utcnow().strftime('%Y%m%dT%H%M%SZ')}.csv")
 
-# =================== UI: HISTORY ===================
+# ─────────────────────────────────────────────────────────
+# UI: HISTORY
+# ─────────────────────────────────────────────────────────
 elif tab == "History":
     st.title("🗂️ Scrape History")
 
@@ -532,7 +538,7 @@ elif tab == "History":
     dfb["created_at"] = pd.to_datetime(dfb["created_at"])
     col1, col2 = st.columns([2,1])
     with col1:
-        st.dataframe(dfb[["id","created_at","year","month","tool_type","description"]], use_container_width=True)
+        st.dataframe(dfb[["id","created_at","year","month","tool_type","description"]].head(50), use_container_width=True)
     with col2:
         years = ["All"] + sorted(dfb["year"].unique().tolist(), reverse=True)
         ysel = st.selectbox("Year", years, index=0)
@@ -560,77 +566,71 @@ elif tab == "History":
                 dfr = pd.DataFrame(rows)
                 st.success(f"{len(dfr)} rows found.")
                 st.dataframe(dfr.head(25), use_container_width=True)
-                st.download_button(
-                    "Download batch CSV",
-                    dfr.to_csv(index=False).encode("utf-8"),
-                    file_name=f"batch_{bid}_{datetime.utcnow().strftime('%Y%m%dT%H%M%SZ')}.csv"
-                )
+                st.download_button("Download batch CSV", dfr.to_csv(index=False).encode("utf-8"),
+                                   file_name=f"batch_{bid}_{datetime.utcnow().strftime('%Y%m%dT%H%M%SZ')}.csv")
             else:
                 st.info("No rows found for this batch.")
 
-# =================== UI: DIAGNOSTICS ===================
+# ─────────────────────────────────────────────────────────
+# UI: DIAGNOSTICS
+# ─────────────────────────────────────────────────────────
 elif tab == "Diagnostics":
     st.title("🧪 Diagnostics")
 
-    # Show what keys we have
-    st.subheader("Keys present?")
-    st.write("BING_API_KEY present:", bool(st.secrets.get("BING_API_KEY")))
-    st.write("BING_ENDPOINT:", st.secrets.get("BING_ENDPOINT", "(not set)"))
-    st.write("GOOGLE_API_KEY present:", bool(st.secrets.get("GOOGLE_API_KEY")))
-    st.write("GOOGLE_CX present:", bool(st.secrets.get("GOOGLE_CX")))
-    st.write("SERPAPI_KEY present:", bool(st.secrets.get("SERPAPI_KEY")))
+    test_company = st.text_input("Company to test search with", "Murata Electronics")
+    test_url = st.text_input("URL to test plain fetch", "https://www.murata.com")
 
-    test_query = st.text_input("Test query", value="Murata")
-    if st.button("Run Diagnostics", type="primary"):
-        async def run_diag():
-            out = {}
-            timeout_cfg = aiohttp.ClientTimeout(total=20)
-            headers = {"User-Agent":"AC-Scraper/diag"}
-            async with aiohttp.ClientSession(timeout=timeout_cfg, headers=headers) as session:
-                # Bing test
-                bkey = st.secrets.get("BING_API_KEY")
-                bend = (st.secrets.get("BING_ENDPOINT") or "https://api.bing.microsoft.com").rstrip("/")
-                if bkey:
+    async def diag():
+        timeout_cfg = aiohttp.ClientTimeout(total=14)
+        async with aiohttp.ClientSession(timeout=timeout_cfg, trust_env=True) as s:
+            # Bing test
+            bing_info = {}
+            try:
+                path = _bing_path_for_endpoint(BING_ENDPOINT)
+                burl = f"{BING_ENDPOINT.rstrip('/')}{path}"
+                headers = {"Ocp-Apim-Subscription-Key": BING_API_KEY}
+                params = {"q": test_company, "count": 3, "responseFilter": "Webpages", "mkt": "en-US"}
+                async with s.get(burl, params=params, headers=headers) as r:
+                    bing_info["status"] = r.status
                     try:
-                        url = f"{bend}/bing/v7.0/search"
-                        params = {"q": test_query, "count": 2, "responseFilter": "Webpages"}
-                        async with session.get(url, params=params, headers={"Ocp-Apim-Subscription-Key": bkey}) as r:
-                            out["bing_status"] = r.status
-                            out["bing_json"] = await r.json()
-                    except Exception as e:
-                        out["bing_error"] = str(e)
-                else:
-                    out["bing_note"] = "No BING_API_KEY"
+                        bing_info["json"] = await r.json()
+                    except Exception:
+                        bing_info["text"] = await r.text()
+            except Exception as e:
+                bing_info["error"] = str(e)
 
-                # Google CSE test
-                gkey = st.secrets.get("GOOGLE_API_KEY")
-                gcx  = st.secrets.get("GOOGLE_CX")
-                if gkey and gcx:
+            # Google test
+            google_info = {}
+            try:
+                gurl = "https://www.googleapis.com/customsearch/v1"
+                params = {"key": GOOGLE_API_KEY, "cx": GOOGLE_CX, "q": test_company, "num": 2}
+                async with s.get(gurl, params=params) as r:
+                    google_info["status"] = r.status
                     try:
-                        url = "https://www.googleapis.com/customsearch/v1"
-                        params = {"key": gkey, "cx": gcx, "q": test_query, "num": 2}
-                        async with session.get(url, params=params) as r:
-                            out["google_status"] = r.status
-                            try:
-                                out["google_json"] = await r.json()
-                            except Exception:
-                                out["google_text"] = await r.text()
-                    except Exception as e:
-                        out["google_error"] = str(e)
-                else:
-                    out["google_note"] = "No GOOGLE_API_KEY/GOOGLE_CX"
+                        google_info["json"] = await r.json()
+                    except Exception:
+                        google_info["text"] = await r.text()
+            except Exception as e:
+                google_info["error"] = str(e)
 
-                # Plain fetch test
-                try:
-                    async with session.get("https://www.murata.com") as r:
-                        html = await r.text()
-                        out["plain_status"] = r.status
-                        out["plain_final_url"] = str(r.url)
-                        out["plain_sample"] = html[:800]
-                except Exception as e:
-                    out["plain_error"] = str(e)
-            return out
+            # Plain fetch
+            plain_info = {}
+            try:
+                async with s.get(test_url, allow_redirects=True) as r:
+                    plain_info["status"] = r.status
+                    plain_info["final_url"] = str(r.url)
+                    txt = await r.text(errors="ignore")
+                    plain_info["sample"] = txt[:800]
+            except Exception as e:
+                plain_info["error"] = str(e)
 
-        res = asyncio.run(run_diag())
-        st.subheader("Results")
-        st.code(json.dumps(res, indent=2)[:20000])
+            return {"bing": bing_info, "google": google_info, "plain": plain_info}
+
+    if st.button("Run diagnostics"):
+        info = asyncio.run(diag())
+        st.subheader("Bing")
+        st.code(json.dumps(info["bing"], indent=2))
+        st.subheader("Google")
+        st.code(json.dumps(info["google"], indent=2))
+        st.subheader("Plain fetch")
+        st.code(json.dumps(info["plain"], indent=2))
