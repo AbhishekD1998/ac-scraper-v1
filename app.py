@@ -1,4 +1,7 @@
-import os, re, json, asyncio
+import os
+import re
+import json
+import asyncio
 from datetime import datetime
 from urllib.parse import urlparse, urljoin
 
@@ -94,19 +97,38 @@ def init_db():
           FOREIGN KEY (scrape_id) REFERENCES scrapes(id)
         );
         """)
+
 init_db()
 
 def create_scrape_batch(description: str, tool_type: str) -> int:
     now = datetime.utcnow()
     with engine.begin() as conn:
-        conn.execute(
-            text("INSERT INTO scrapes (created_at, year, month, description, tool_type) VALUES (:ts,:y,:m,:d,:t)"),
-            {"ts": now, "y": now.year, "m": now.month, "d": description.strip(), "t": tool_type}
-        )
-        if engine.url.get_backend_name().startswith("sqlite"):
-            scrape_id = conn.execute(text("SELECT last_insert_rowid()")).scalar()
-        else:
-            scrape_id = conn.execute(text("SELECT LASTVAL()")).scalar()
+        # Try INSERT ... RETURNING id (works with Postgres and modern SQLite). Fallbacks below.
+        try:
+            res = conn.execute(
+                text("INSERT INTO scrapes (created_at, year, month, description, tool_type) VALUES (:ts,:y,:m,:d,:t) RETURNING id"),
+                {"ts": now, "y": now.year, "m": now.month, "d": description.strip(), "t": tool_type}
+            )
+            scrape_id = res.scalar_one()
+            return int(scrape_id)
+        except Exception:
+            # Insert without RETURNING, then get id depending on dialect
+            conn.execute(
+                text("INSERT INTO scrapes (created_at, year, month, description, tool_type) VALUES (:ts,:y,:m,:d,:t)"),
+                {"ts": now, "y": now.year, "m": now.month, "d": description.strip(), "t": tool_type}
+            )
+            dialect = engine.dialect.name.lower()
+            if dialect == "sqlite":
+                scrape_id = conn.execute(text("SELECT last_insert_rowid()")).scalar()
+            elif dialect in ("postgresql", "postgres"):
+                # Attempt to use LASTVAL (relies on default sequence behavior)
+                try:
+                    scrape_id = conn.execute(text("SELECT LASTVAL()")).scalar()
+                except Exception:
+                    # best effort fallback: query latest by timestamp (race possible but unlikely)
+                    scrape_id = conn.execute(text("SELECT id FROM scrapes ORDER BY created_at DESC LIMIT 1")).scalar()
+            else:
+                scrape_id = conn.execute(text("SELECT id FROM scrapes ORDER BY created_at DESC LIMIT 1")).scalar()
     return int(scrape_id)
 
 def save_records(scrape_id: int, df: pd.DataFrame):
@@ -140,12 +162,17 @@ PHONE_RE = re.compile(r"(\+?\d[\d\-\s().]{6,}\d)")
 def normalize_url(url: str):
     if not url: return None
     url = url.strip()
+    # ignore javascript/mailto anchors
+    if url.lower().startswith(("mailto:", "javascript:")):
+        return None
     if url.startswith("//"): url = "http:" + url
-    if not urlparse(url).scheme: url = "http://" + url
-    return url if urlparse(url).netloc else None
+    if not urlparse(url).scheme:
+        url = "http://" + url
+    p = urlparse(url)
+    return url if p.netloc else None
 
 def clean_visible_text(html: str):
-    soup = BeautifulSoup(html, "html.parser")
+    soup = BeautifulSoup(html or "", "html.parser")
     for tag in soup(["script","style","noscript","iframe"]):
         tag.decompose()
     return soup.get_text(separator="\n", strip=True)
@@ -220,8 +247,6 @@ def find_contact_links(base: str, html: str):
 # SEARCH (Bing first, Google fallback)
 # ─────────────────────────────────────────────────────────
 def _bing_path_for_endpoint(endpoint: str) -> str:
-    # If using Cognitive Services endpoint -> /bing/v7.0/search
-    # If using global Bing endpoint -> /v7.0/search
     ep = (endpoint or "").lower().strip("/")
     return "/bing/v7.0/search" if "cognitiveservices.azure.com" in ep else "/v7.0/search"
 
@@ -245,15 +270,14 @@ async def search_official_site(session, company: str, timeout_s=12):
                                 candidates.append(link)
                         # pick a homepage-ish link if possible
                         for link in candidates:
-                            if is_probably_homepage(link): 
+                            if is_probably_homepage(link):
                                 return link
                         if candidates:
                             return candidates[0]
-                    # if 401/404 etc, fall through to Google
         except Exception:
             pass
 
-    # 2) Google CSE (daily quota 100)
+    # 2) Google CSE
     if GOOGLE_API_KEY and GOOGLE_CX:
         try:
             gurl = "https://www.googleapis.com/customsearch/v1"
@@ -326,6 +350,7 @@ async def process_row_website(session, sem, row, opts):
         if all_emails:
             for e in all_emails:
                 result.append({"company": company, "website": final, "email": e, "phone": "", "address": "", "source": ",".join(sorted(sources.get(e, {final})))})
+
             return result, None
         else:
             failed["notes"] = "no-emails-found"
@@ -450,6 +475,7 @@ if tab.startswith("Scraper"):
                 logs.append(f"Processed {done}/{total}")
                 log.code("\n".join(logs[-12:]))
 
+            # run the async scraper
             results, failed = asyncio.run(run_all_website(rows, opts, cb=cb))
 
             if results:
@@ -545,92 +571,4 @@ elif tab == "History":
         msel = st.selectbox("Month", ["All"] + sorted(dfb["month"].unique().tolist(), reverse=True), index=0)
 
     fdf = dfb.copy()
-    if ysel != "All": fdf = fdf[fdf["year"] == ysel]
-    if msel != "All": fdf = fdf[fdf["month"] == msel]
-
-    st.markdown("### Download a batch")
-    batch_ids = fdf["id"].tolist()
-    if not batch_ids:
-        st.info("No batches match the selected filters.")
-    else:
-        bid = st.selectbox("Choose a batch ID", batch_ids, index=0)
-        if st.button("Prepare CSV"):
-            with engine.begin() as conn:
-                rows = conn.execute(text("""
-                    SELECT company, website, email, phone, address, source
-                    FROM records
-                    WHERE scrape_id = :sid
-                    ORDER BY company
-                """), {"sid": bid}).mappings().all()
-            if rows:
-                dfr = pd.DataFrame(rows)
-                st.success(f"{len(dfr)} rows found.")
-                st.dataframe(dfr.head(25), use_container_width=True)
-                st.download_button("Download batch CSV", dfr.to_csv(index=False).encode("utf-8"),
-                                   file_name=f"batch_{bid}_{datetime.utcnow().strftime('%Y%m%dT%H%M%SZ')}.csv")
-            else:
-                st.info("No rows found for this batch.")
-
-# ─────────────────────────────────────────────────────────
-# UI: DIAGNOSTICS
-# ─────────────────────────────────────────────────────────
-elif tab == "Diagnostics":
-    st.title("🧪 Diagnostics")
-
-    test_company = st.text_input("Company to test search with", "Murata Electronics")
-    test_url = st.text_input("URL to test plain fetch", "https://www.murata.com")
-
-    async def diag():
-        timeout_cfg = aiohttp.ClientTimeout(total=14)
-        async with aiohttp.ClientSession(timeout=timeout_cfg, trust_env=True) as s:
-            # Bing test
-            bing_info = {}
-            try:
-                path = _bing_path_for_endpoint(BING_ENDPOINT)
-                burl = f"{BING_ENDPOINT.rstrip('/')}{path}"
-                headers = {"Ocp-Apim-Subscription-Key": BING_API_KEY}
-                params = {"q": test_company, "count": 3, "responseFilter": "Webpages", "mkt": "en-US"}
-                async with s.get(burl, params=params, headers=headers) as r:
-                    bing_info["status"] = r.status
-                    try:
-                        bing_info["json"] = await r.json()
-                    except Exception:
-                        bing_info["text"] = await r.text()
-            except Exception as e:
-                bing_info["error"] = str(e)
-
-            # Google test
-            google_info = {}
-            try:
-                gurl = "https://www.googleapis.com/customsearch/v1"
-                params = {"key": GOOGLE_API_KEY, "cx": GOOGLE_CX, "q": test_company, "num": 2}
-                async with s.get(gurl, params=params) as r:
-                    google_info["status"] = r.status
-                    try:
-                        google_info["json"] = await r.json()
-                    except Exception:
-                        google_info["text"] = await r.text()
-            except Exception as e:
-                google_info["error"] = str(e)
-
-            # Plain fetch
-            plain_info = {}
-            try:
-                async with s.get(test_url, allow_redirects=True) as r:
-                    plain_info["status"] = r.status
-                    plain_info["final_url"] = str(r.url)
-                    txt = await r.text(errors="ignore")
-                    plain_info["sample"] = txt[:800]
-            except Exception as e:
-                plain_info["error"] = str(e)
-
-            return {"bing": bing_info, "google": google_info, "plain": plain_info}
-
-    if st.button("Run diagnostics"):
-        info = asyncio.run(diag())
-        st.subheader("Bing")
-        st.code(json.dumps(info["bing"], indent=2))
-        st.subheader("Google")
-        st.code(json.dumps(info["google"], indent=2))
-        st.subheader("Plain fetch")
-        st.code(json.dumps(info["plain"], indent=2))
+    if ysel != "All": fdf = fd
