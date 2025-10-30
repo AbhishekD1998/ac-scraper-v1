@@ -27,15 +27,15 @@ st.markdown("---")
 USERNAME = st.secrets.get("USERNAME", "abhishekcreations")
 PASSWORD = st.secrets.get("PASSWORD", "ac2006")
 
-# Search keys (prefer secrets; fallback to the values you shared)
-BING_API_KEY = st.secrets.get("BING_API_KEY", "GBPg4aTJMsOuszHOmyH9WtxMh5IuATnnMxz40k4cRw2Y8FQbMCxXJQQJ99BIACYeBjFXJ3w3AAAEACOGhOLu")
-BING_ENDPOINT = st.secrets.get("BING_ENDPOINT", "https://ac-scraper-bing.cognitiveservices.azure.com")
+# Search keys (prefer secrets; fallback to environment)
+BING_API_KEY = st.secrets.get("BING_API_KEY", "") or os.getenv("BING_API_KEY", "")
+BING_ENDPOINT = st.secrets.get("BING_ENDPOINT", "") or os.getenv("BING_ENDPOINT", "")
 
-GOOGLE_API_KEY = st.secrets.get("GOOGLE_API_KEY", "AIzaSyBOKdDa8bRYLsBKvEfJlR7fn6v25OzjWzc")
-GOOGLE_CX      = st.secrets.get("GOOGLE_CX", "d4816afb144cb4f3b")
+GOOGLE_API_KEY = st.secrets.get("GOOGLE_API_KEY", "") or os.getenv("GOOGLE_API_KEY", "")
+GOOGLE_CX      = st.secrets.get("GOOGLE_CX", "") or os.getenv("GOOGLE_CX", "")
 
 # DB (SQLite by default; Postgres if DATABASE_URL provided)
-DATABASE_URL = st.secrets.get("DATABASE_URL", "").strip()
+DATABASE_URL = st.secrets.get("DATABASE_URL", "") or os.getenv("DATABASE_URL", "")
 
 # ─────────────────────────────────────────────────────────
 # LOGIN
@@ -97,37 +97,21 @@ def init_db():
           FOREIGN KEY (scrape_id) REFERENCES scrapes(id)
         );
         """)
-
 init_db()
 
 def create_scrape_batch(description: str, tool_type: str) -> int:
     now = datetime.utcnow()
     with engine.begin() as conn:
-        # Try INSERT ... RETURNING id (works with Postgres and modern SQLite). Fallbacks below.
-        try:
-            res = conn.execute(
-                text("INSERT INTO scrapes (created_at, year, month, description, tool_type) VALUES (:ts,:y,:m,:d,:t) RETURNING id"),
-                {"ts": now, "y": now.year, "m": now.month, "d": description.strip(), "t": tool_type}
-            )
-            scrape_id = res.scalar_one()
-            return int(scrape_id)
-        except Exception:
-            # Insert without RETURNING, then get id depending on dialect
-            conn.execute(
-                text("INSERT INTO scrapes (created_at, year, month, description, tool_type) VALUES (:ts,:y,:m,:d,:t)"),
-                {"ts": now, "y": now.year, "m": now.month, "d": description.strip(), "t": tool_type}
-            )
-            dialect = engine.dialect.name.lower()
-            if dialect == "sqlite":
-                scrape_id = conn.execute(text("SELECT last_insert_rowid()")).scalar()
-            elif dialect in ("postgresql", "postgres"):
-                # Attempt to use LASTVAL (relies on default sequence behavior)
-                try:
-                    scrape_id = conn.execute(text("SELECT LASTVAL()")).scalar()
-                except Exception:
-                    # best effort fallback: query latest by timestamp (race possible but unlikely)
-                    scrape_id = conn.execute(text("SELECT id FROM scrapes ORDER BY created_at DESC LIMIT 1")).scalar()
-            else:
+        conn.execute(
+            text("INSERT INTO scrapes (created_at, year, month, description, tool_type) VALUES (:ts,:y,:m,:d,:t)"),
+            {"ts": now, "y": now.year, "m": now.month, "d": description.strip(), "t": tool_type}
+        )
+        if engine.dialect.name.lower().startswith("sqlite"):
+            scrape_id = conn.execute(text("SELECT last_insert_rowid()")).scalar()
+        else:
+            try:
+                scrape_id = conn.execute(text("SELECT LASTVAL()")).scalar()
+            except Exception:
                 scrape_id = conn.execute(text("SELECT id FROM scrapes ORDER BY created_at DESC LIMIT 1")).scalar()
     return int(scrape_id)
 
@@ -141,57 +125,55 @@ def save_records(scrape_id: int, df: pd.DataFrame):
         return
     with engine.begin() as conn:
         conn.execute(
-            text("""
+            text(\"\"\"
                 INSERT INTO records (scrape_id, company, website, email, phone, address, source)
                 VALUES (:scrape_id, :company, :website, :email, :phone, :address, :source)
-            """),
+            \"\"\"),
             [{"scrape_id": scrape_id, **r} for r in rows]
         )
 
 # ─────────────────────────────────────────────────────────
 # SCRAPING HELPERS
 # ─────────────────────────────────────────────────────────
-EMAIL_RE = re.compile(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}", re.I)
+EMAIL_RE = re.compile(r\"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\\.[A-Za-z]{2,}\", re.I)
 OBFUSCATED_RE = re.compile(
-    r"([A-Za-z0-9._%+-]+)\s*(?:\[at\]|\(at\)| at |\s@\s|@)\s*([A-Za-z0-9.-]+)\s*(?:\[dot\]|\(dot\)| dot |\s\.\s|\.)\s*([A-Za-z]{2,})",
+    r\"([A-Za-z0-9._%+-]+)\\s*(?:\\[at\\]|\\(at\\)| at |\\s@\\s|@)\\s*([A-Za-z0-9.-]+)\\s*(?:\\[dot\\]|\\(dot\\)| dot |\\s\\.\\s|\\.)\\s*([A-Za-z]{2,})\",
     re.I
 )
-CONTACT_KEYS = ["contact","kontakt","impressum","about","contact-us","get-in-touch","kontak","contato"]
-PHONE_RE = re.compile(r"(\+?\d[\d\-\s().]{6,}\d)")
+CONTACT_KEYS = [\"contact\",\"kontakt\",\"impressum\",\"about\",\"contact-us\",\"get-in-touch\",\"kontak\",\"contato\"]
+PHONE_RE = re.compile(r\"(\\+?\\d[\\d\\-\\s().]{6,}\\d)\")
 
 def normalize_url(url: str):
     if not url: return None
     url = url.strip()
-    # ignore javascript/mailto anchors
-    if url.lower().startswith(("mailto:", "javascript:")):
+    if url.lower().startswith((\"mailto:\", \"javascript:\")):
         return None
-    if url.startswith("//"): url = "http:" + url
+    if url.startswith(\"//\"): url = \"http:\" + url
     if not urlparse(url).scheme:
-        url = "http://" + url
+        url = \"http://\" + url
     p = urlparse(url)
     return url if p.netloc else None
 
 def clean_visible_text(html: str):
-    soup = BeautifulSoup(html or "", "html.parser")
-    for tag in soup(["script","style","noscript","iframe"]):
+    soup = BeautifulSoup(html or \"\", \"html.parser\")
+    for tag in soup([\"script\",\"style\",\"noscript\",\"iframe\"]):
         tag.decompose()
-    return soup.get_text(separator="\n", strip=True)
+    return soup.get_text(separator=\"\\n\", strip=True)
 
 def extract_emails(text: str):
     if not text: return []
     found = set(m.strip() for m in EMAIL_RE.findall(text))
     for m in OBFUSCATED_RE.findall(text):
         local, domain, tld = m
-        found.add(f"{local}@{domain}.{tld}")
-    # prefer non-noreply first ordering (keep uniqueness)
-    sorted_list = sorted(found, key=lambda e: ("noreply" in e.lower() or "no-reply" in e.lower(), e))
-    return [e for e in sorted_list if "@" in e and len(e) <= 254]
+        found.add(f\"{local}@{domain}.{tld}\")
+    sorted_list = sorted(found, key=lambda e: (\"noreply\" in e.lower() or \"no-reply\" in e.lower(), e))
+    return [e for e in sorted_list if \"@\" in e and len(e) <= 254]
 
 def extract_phones(text: str):
     results = set()
-    for raw in PHONE_RE.findall(text or ""):
+    for raw in PHONE_RE.findall(text or \"\"):
         try:
-            for region in ("US","IN","GB","DE","AE"):
+            for region in (\"US\",\"IN\",\"GB\",\"DE\",\"AE\"):
                 p = phonenumbers.parse(raw, region)
                 if phonenumbers.is_possible_number(p) and phonenumbers.is_valid_number(p):
                     results.add(phonenumbers.format_number(p, phonenumbers.PhoneNumberFormat.INTERNATIONAL))
@@ -203,18 +185,18 @@ def extract_phones(text: str):
 def extract_address_snippets(text: str):
     if not text: return []
     lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
-    keys = ("address","head office","registered office","location","office","impressum")
+    keys = (\"address\",\"head office\",\"registered office\",\"location\",\"office\",\"impressum\")
     out = []
     for i, ln in enumerate(lines):
         low = ln.lower()
-        if any(k in low for k in keys) and ("," in ln or any(ch.isdigit() for ch in ln)):
+        if any(k in low for k in keys) and (\",\" in ln or any(ch.isdigit() for ch in ln)):
             snippet = ln
-            if i+1 < len(lines) and ("," in lines[i+1] or any(ch.isdigit() for ch in lines[i+1])):
-                snippet += " " + lines[i+1]
+            if i+1 < len(lines) and (\",\" in lines[i+1] or any(ch.isdigit() for ch in lines[i+1])):
+                snippet += \" \" + lines[i+1]
             out.append(snippet)
     clean, seen = [], set()
     for s in out:
-        s = " ".join(s.split())
+        s = \" \".join(s.split())
         if s not in seen:
             seen.add(s)
             clean.append(s[:300])
@@ -225,7 +207,7 @@ async def fetch(session: aiohttp.ClientSession, url: str, timeout_s: int, tries:
         try:
             async with asyncio.timeout(timeout_s):
                 async with session.get(url, allow_redirects=True) as resp:
-                    txt = await resp.text(errors="ignore")
+                    txt = await resp.text(errors=\"ignore\")
                     return txt, str(resp.url)
         except Exception:
             await asyncio.sleep(0.6 * attempt)
@@ -233,11 +215,11 @@ async def fetch(session: aiohttp.ClientSession, url: str, timeout_s: int, tries:
 
 def find_contact_links(base: str, html: str):
     if not html: return []
-    soup = BeautifulSoup(html, "html.parser")
+    soup = BeautifulSoup(html, \"html.parser\")
     links = []
-    for a in soup.find_all("a", href=True):
-        href = a["href"].strip()
-        text = (a.get_text() or "").lower()
+    for a in soup.find_all(\"a\", href=True):
+        href = a[\"href\"].strip()
+        text = (a.get_text() or \"\").lower()
         if any(k in href.lower() for k in CONTACT_KEYS) or any(k in text for k in CONTACT_KEYS):
             links.append(urljoin(base, href))
     # unique + limit
@@ -247,37 +229,38 @@ def find_contact_links(base: str, html: str):
 # SEARCH (Bing first, Google fallback)
 # ─────────────────────────────────────────────────────────
 def _bing_path_for_endpoint(endpoint: str) -> str:
-    ep = (endpoint or "").lower().strip("/")
-    return "/bing/v7.0/search" if "cognitiveservices.azure.com" in ep else "/v7.0/search"
+    ep = (endpoint or \"\").lower().strip(\"/\")
+    return \"/bing/v7.0/search\" if \"cognitiveservices.azure.com\" in ep else \"/v7.0/search\"
 
 async def search_official_site(session, company: str, timeout_s=12):
     # 1) Bing (Azure)
     if BING_API_KEY and BING_ENDPOINT:
         try:
             path = _bing_path_for_endpoint(BING_ENDPOINT)
-            url = f"{BING_ENDPOINT.rstrip('/')}{path}"
-            headers = {"Ocp-Apim-Subscription-Key": BING_API_KEY}
-            params = {"q": company, "count": 5, "responseFilter": "Webpages", "mkt": "en-US", "safeSearch": "Moderate"}
+            url = f\"{BING_ENDPOINT.rstrip('/')}{path}\"
+            headers = {\"Ocp-Apim-Subscription-Key\": BING_API_KEY}
+            params = {\"q\": company, \"count\": 5, \"responseFilter\": \"Webpages\", \"mkt\": \"en-US\", \"safeSearch\": \"Moderate\"}
             async with asyncio.timeout(timeout_s):
                 async with session.get(url, params=params, headers=headers) as r:
                     if r.status == 200:
                         data = await r.json()
-                        web = (data or {}).get("webPages", {}).get("value", [])
+                        web = (data or {}).get(\"webPages\", {}).get(\"value\", [])
                         candidates = []
                         for it in web:
-                            link = it.get("url")
+                            link = it.get(\"url\")
                             if link:
                                 candidates.append(link)
                         # pick a homepage-ish link if possible
                         for link in candidates:
-                            if is_probably_homepage(link):
+                            if is_probably_homepage(link): 
                                 return link
                         if candidates:
                             return candidates[0]
+                    # if 401/404 etc, fall through to Google
         except Exception:
             pass
 
-    # 2) Google CSE
+    # 2) Google CSE (daily quota 100)
     if GOOGLE_API_KEY and GOOGLE_CX:
         try:
             gurl = "https://www.googleapis.com/customsearch/v1"
@@ -350,7 +333,6 @@ async def process_row_website(session, sem, row, opts):
         if all_emails:
             for e in all_emails:
                 result.append({"company": company, "website": final, "email": e, "phone": "", "address": "", "source": ",".join(sorted(sources.get(e, {final})))})
-
             return result, None
         else:
             failed["notes"] = "no-emails-found"
@@ -420,25 +402,7 @@ async def company_to_contacts(session, company, opts):
     else:
         return [], {"company": company, "website": final, "notes": "no-emails-found"}
 
-async def run_all_company(names, opts, cb=None):
-    timeout_cfg = aiohttp.ClientTimeout(total=opts["timeout"] + 6)
-    connector = aiohttp.TCPConnector(limit_per_host=opts["concurrency"], ssl=False)
-    sem = asyncio.Semaphore(opts["concurrency"])
-    results, failed = [], []
-    async with aiohttp.ClientSession(timeout=timeout_cfg, connector=connector, trust_env=True, headers={"User-Agent":"AC-Scraper/1.0"}) as session:
-        tasks = [company_to_contacts(session, nm, opts) for nm in names]
-        total = len(tasks); done = 0
-        for fut in asyncio.as_completed(tasks):
-            rows, fail = await fut
-            if rows: results.extend(rows)
-            if fail: failed.append(fail)
-            done += 1
-            if cb: cb(done, total)
-    return results, failed
-
-# ─────────────────────────────────────────────────────────
 # UI: WEBSITES CSV
-# ─────────────────────────────────────────────────────────
 if tab.startswith("Scraper"):
     st.title("📧 Email Scraper (Websites CSV)")
     description = st.text_input("Batch description (required before scraping)", placeholder="e.g., SMM Hamburg exhibitors Aug 2025")
@@ -473,9 +437,8 @@ if tab.startswith("Scraper"):
                 pct = int(done/total*100) if total else 100
                 progress_bar.progress(pct)
                 logs.append(f"Processed {done}/{total}")
-                log.code("\n".join(logs[-12:]))
+                log.code("\\n".join(logs[-12:]))
 
-            # run the async scraper
             results, failed = asyncio.run(run_all_website(rows, opts, cb=cb))
 
             if results:
@@ -493,14 +456,12 @@ if tab.startswith("Scraper"):
                 st.download_button("Download failed CSV", miss.to_csv(index=False).encode("utf-8"),
                                    file_name=f"failed_{datetime.utcnow().strftime('%Y%m%dT%H%M%SZ')}.csv")
 
-# ─────────────────────────────────────────────────────────
 # UI: COMPANY → CONTACT FINDER
-# ─────────────────────────────────────────────────────────
 elif tab.startswith("Company"):
     st.title("🏢 Company → Contact Finder")
 
     description = st.text_input("Batch description (required before finding)", placeholder="e.g., Marine OEMs shortlist Sept 2025")
-    txt = st.text_area("Companies (one per line)", height=180, placeholder="ACME Corp\nFoo Technologies\nBar Shipping GmbH")
+    txt = st.text_area("Companies (one per line)", height=180, placeholder="ACME Corp\\nFoo Technologies\\nBar Shipping GmbH")
 
     colA, colB, colC = st.columns(3)
     with colA: follow_contacts = st.checkbox("Follow contact/about pages", value=True)
@@ -518,7 +479,7 @@ elif tab.startswith("Company"):
             pct = int(done/total*100) if total else 100
             progress_bar.progress(pct)
             logs.append(f"Processed {done}/{total}")
-            log.code("\n".join(logs[-12:]))
+            log.code("\\n".join(logs[-12:]))
 
         results, failed = asyncio.run(
             run_all_company(
@@ -543,9 +504,7 @@ elif tab.startswith("Company"):
             st.download_button("Download failed CSV", df_fail.to_csv(index=False).encode("utf-8"),
                                file_name=f"company_failed_{datetime.utcnow().strftime('%Y%m%dT%H%M%SZ')}.csv")
 
-# ─────────────────────────────────────────────────────────
 # UI: HISTORY
-# ─────────────────────────────────────────────────────────
 elif tab == "History":
     st.title("🗂️ Scrape History")
 
@@ -571,4 +530,90 @@ elif tab == "History":
         msel = st.selectbox("Month", ["All"] + sorted(dfb["month"].unique().tolist(), reverse=True), index=0)
 
     fdf = dfb.copy()
-    if ysel != "All": fdf = fd
+    if ysel != "All": fdf = fdf[fdf["year"] == ysel]
+    if msel != "All": fdf = fdf[fdf["month"] == msel]
+
+    st.markdown("### Download a batch")
+    batch_ids = fdf["id"].tolist()
+    if not batch_ids:
+        st.info("No batches match the selected filters.")
+    else:
+        bid = st.selectbox("Choose a batch ID", batch_ids, index=0)
+        if st.button("Prepare CSV"):
+            with engine.begin() as conn:
+                rows = conn.execute(text("""
+                    SELECT company, website, email, phone, address, source
+                    FROM records
+                    WHERE scrape_id = :sid
+                    ORDER BY company
+                """), {"sid": bid}).mappings().all()
+            if rows:
+                dfr = pd.DataFrame(rows)
+                st.success(f"{len(dfr)} rows found.")
+                st.dataframe(dfr.head(25), use_container_width=True)
+                st.download_button("Download batch CSV", dfr.to_csv(index=False).encode("utf-8"),
+                                   file_name=f"batch_{bid}_{datetime.utcnow().strftime('%Y%m%dT%H%M%SZ')}.csv")
+            else:
+                st.info("No rows found for this batch.")
+
+# UI: DIAGNOSTICS
+elif tab == "Diagnostics":
+    st.title("🧪 Diagnostics")
+
+    test_company = st.text_input("Company to test search with", "Murata Electronics")
+    test_url = st.text_input("URL to test plain fetch", "https://www.murata.com")
+
+    async def diag():
+        timeout_cfg = aiohttp.ClientTimeout(total=14)
+        async with aiohttp.ClientSession(timeout=timeout_cfg, trust_env=True) as s:
+            # Bing test
+            bing_info = {}
+            try:
+                path = _bing_path_for_endpoint(BING_ENDPOINT)
+                burl = f"{BING_ENDPOINT.rstrip('/')}{path}"
+                headers = {"Ocp-Apim-Subscription-Key": BING_API_KEY}
+                params = {"q": test_company, "count": 3, "responseFilter": "Webpages", "mkt": "en-US"}
+                async with s.get(burl, params=params, headers=headers) as r:
+                    bing_info["status"] = r.status
+                    try:
+                        bing_info["json"] = await r.json()
+                    except Exception:
+                        bing_info["text"] = await r.text()
+            except Exception as e:
+                bing_info["error"] = str(e)
+
+            # Google test
+            google_info = {}
+            try:
+                gurl = "https://www.googleapis.com/customsearch/v1"
+                params = {"key": GOOGLE_API_KEY, "cx": GOOGLE_CX, "q": test_company, "num": 2}
+                async with s.get(gurl, params=params) as r:
+                    google_info["status"] = r.status
+                    try:
+                        google_info["json"] = await r.json()
+                    except Exception:
+                        google_info["text"] = await r.text()
+            except Exception as e:
+                google_info["error"] = str(e)
+
+            # Plain fetch
+            plain_info = {}
+            try:
+                async with s.get(test_url, allow_redirects=True) as r:
+                    plain_info["status"] = r.status
+                    plain_info["final_url"] = str(r.url)
+                    txt = await r.text(errors="ignore")
+                    plain_info["sample"] = txt[:800]
+            except Exception as e:
+                plain_info["error"] = str(e)
+
+            return {"bing": bing_info, "google": google_info, "plain": plain_info}
+
+    if st.button("Run diagnostics"):
+        info = asyncio.run(diag())
+        st.subheader("Bing")
+        st.code(json.dumps(info["bing"], indent=2))
+        st.subheader("Google")
+        st.code(json.dumps(info["google"], indent=2))
+        st.subheader("Plain fetch")
+        st.code(json.dumps(info["plain"], indent=2))
