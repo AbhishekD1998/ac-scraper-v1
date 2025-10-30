@@ -125,10 +125,10 @@ def save_records(scrape_id: int, df: pd.DataFrame):
         return
     with engine.begin() as conn:
         conn.execute(
-            text(\"\"\"
+            text("""
                 INSERT INTO records (scrape_id, company, website, email, phone, address, source)
                 VALUES (:scrape_id, :company, :website, :email, :phone, :address, :source)
-            \"\"\"),
+            """),
             [{"scrape_id": scrape_id, **r} for r in rows]
         )
 
